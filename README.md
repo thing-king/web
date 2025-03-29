@@ -1,6 +1,6 @@
-# Nim Web Package
+# Web
 
-A macro-based HTML generation library for Nim with integrated CSS support.
+Macro-based HTML generation library for Nim with integrated CSS support.
 
 ## Installation
 
