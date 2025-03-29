@@ -76,7 +76,8 @@ styles.marginBlock  = {1.px, `dynamicValue`}
 web:
   box:
     style styles
-
+    style:
+      color: red # multiple style tags work
 ```
 
 ## Selectors and Advanced Styling
@@ -86,6 +87,7 @@ web:
   p "Interactive element":
     class textElement
     style:
+      # Selectors create indepdent <style> tags
       !textElement:  # Use ! instead of . for class selectors
         color: blue
       
@@ -94,7 +96,8 @@ web:
       
       [root]:  # Root selector
         backgroundColor: white
-        
+    
+      # Property assignments apply to parent
       "custom-property": "value"  # String property names supported
 ```
 
