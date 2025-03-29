@@ -132,11 +132,13 @@ proc Container(children: HTML): HTML =
 # Usage
 let html = web:
   Container:
-    h1 "Website Title"
-    p "Welcome to my site"
+    children:
+      h1 "Website Title"
+      p "Welcome to my site"
 ```
 
 ## Attribute and Style Pass-through
+Passthrough an attribute to apply to the top-level of a component
 
 ```nim
 let html = web:
