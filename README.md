@@ -44,16 +44,39 @@ let html = web:
 The `style` macro leverages the `css` package for property validation:
 
 ```nim
+var textDecorationValue = "underline"
+
 web:
   p "Validated styling":
     style:
       color: red             # Compile-time validation
       fontSize: 16.px        # Units require period
       margin: {8.px, 16.px}  # Multiple values use {}
-      
+      padding: "10px 5px"    # Strings work too
+    
+      # Inject variable
+      textDecoration: `textDecorationValue`
+
       # CSS variables
       --theme-color: blue
       backgroundColor: cvar(--theme-color)  # Use cvar instead of var
+```
+
+Or, via `css` create a `newStyles()` object and pass that as the style:
+```nim
+
+var styles = newStyles()
+styles.marginInline = {1.px, 2.px}  # compile-time validated
+styles.color  = "red"
+
+var dynamicValue = "5px"
+styles.paddingRight = dynamicValue
+styles.marginBlock  = {1.px, `dynamicValue`}
+
+web:
+  box:
+    style styles
+
 ```
 
 ## Selectors and Advanced Styling
