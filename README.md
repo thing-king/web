@@ -1,5 +1,4 @@
-# Web
-
+# web
 Macro-based HTML generation library for Nim with integrated CSS support.
 
 ## Installation
@@ -10,7 +9,8 @@ nimble install web
 
 ## Dependencies
 
-- [css](https://github.com/thing-king/css): Used for both compile-time and runtime CSS validation
+- [css](https://github.com/thing-king/css): CSS DSL, compile and runtime MDN-backed validation
+- [html](https://github.com/thing-king/html): MDN-typed HTML elements
 
 ## Core Features
 
@@ -182,12 +182,3 @@ type HTMLNode* = object
 
 type HTML* = seq[HTMLNode]
 ```
-
-## CSS Validation
-
-CSS property names and values are checked against standard specifications.
-Both:
-1. **Compile-time**: The CSS properties and values are validated during compilation using the `css` package, catching errors before runtime.
-2. **Runtime**: Dynamic values injected at runtime are also validated to ensure proper CSS syntax and semantics.
-
-This approach ensures your styles are both syntactically correct and semantically valid throughout the development lifecycle.
