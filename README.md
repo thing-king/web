@@ -17,21 +17,17 @@ Macro-based HTML & CSS generation system for Nim — powering the **Thing** fram
 * Avoids decoupled global CSS — style remains directly tied to component state
 * Class-based styling supported but discouraged
 * Designed to integrate directly into Thing’s reactive full-stack system
-* Fully integrated state management layer (provided by the full Thing framework)
 
 ---
 
-## State Management (Full Framework)
+## Reactive Engine
 
-In the full Thing framework, `web` integrates with a React-inspired state system, including:
+For full reactive state management, diffing, and lifecycle control, see: [Thing framework](https://github.com/thing-king/thing).
 
-* `useState` style state hooks
-* `useEffect` lifecycle hooks
-* Full diffing-based DOM reconciliation
-* Deterministic state propagation identical to React semantics
-* Built entirely within Nim and fully compile-time validated
-
-This allows building fully reactive, state-driven web applications with declarative Nim code.
+* React-style `useState`, `useEffect`, `useMemo`, etc.
+* Deterministic DOM diffing and reconciliation
+* Fully compile-time validated state and props
+* Deep integration with Thing's declarative dataflow system
 
 ---
 
