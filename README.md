@@ -1,25 +1,50 @@
 # web
-Macro-based HTML generation library for Nim with integrated CSS support.
 
-## Installation
+Macro-based HTML & CSS generation system for Nim — powering the **Thing** framework.
 
-```bash
-nimble install web
-```
+---
+
+## Overview
+
+`web` provides a macro-driven approach to building full web UIs directly in Nim using declarative, type-safe HTML and CSS generation. It integrates directly into the [Thing framework](https://github.com/thing-king/thing).
+
+---
+
+## Key Principles
+
+* Component-driven architecture
+* Inline styles preferred — automatically compiled to isolated CSS classes at build time
+* Avoids decoupled global CSS — style remains directly tied to component state
+* Class-based styling supported but discouraged
+* Designed to integrate directly into Thing’s reactive full-stack system
+* Fully integrated state management layer (provided by the full Thing framework)
+
+---
+
+## State Management (Full Framework)
+
+In the full Thing framework, `web` integrates with a React-inspired state system, including:
+
+* `useState` style state hooks
+* `useEffect` lifecycle hooks
+* Full diffing-based DOM reconciliation
+* Deterministic state propagation identical to React semantics
+* Built entirely within Nim and fully compile-time validated
+
+This allows building fully reactive, state-driven web applications with declarative Nim code.
+
+---
 
 ## Dependencies
 
-- [css](https://github.com/thing-king/css): CSS DSL, compile and runtime MDN-backed validation
-- [html](https://github.com/thing-king/html): MDN-typed HTML elements
+* [css](https://github.com/thing-king/css): Compile-time and runtime CSS validation
+* [html](https://github.com/thing-king/html): MDN-typed HTML elements
 
-## Core Features
+---
 
-- Single `web` macro for HTML generation
-- Integrated `style` macro with CSS validation
-- Component-based architecture
-- CSS property validation at both compile-time and runtime
+## Core Usage
 
-## Basic HTML Generation
+### HTML Generation
 
 ```nim
 import web
@@ -31,7 +56,7 @@ let html = web:
   
   p:
     "Multiple lines"
-    someText # Variable interpolation
+    someText
     
   p:
     "With attributes"
@@ -39,88 +64,85 @@ let html = web:
     class "highlight"
 ```
 
-## Styling with Validation
+---
 
-The `style` macro leverages the `css` package for property validation:
+### Styling
+
+By default, inline styles are compiled into generated CSS classes automatically:
+
+```nim
+web:
+  p "Validated styling":
+    style:
+      color: red
+      fontSize: 16.px
+      margin: {8.px, 16.px}
+```
+
+#### Dynamic values
 
 ```nim
 var textDecorationValue = "underline"
 
 web:
-  p "Validated styling":
+  p "Dynamic style":
     style:
-      color: red             # Compile-time validation
-      fontSize: 16.px        # Units require period
-      margin: {8.px, 16.px}  # Multiple values use {}
-      padding: "10px 5px"    # Strings work too
-    
-      # Inject variable
       textDecoration: `textDecorationValue`
-
-      # CSS variables
-      --theme-color: blue
-      backgroundColor: cvar(--theme-color)  # Use cvar instead of var
 ```
 
-Or, via `css` create a `newStyles()` object and pass that as the style:
+#### External style objects
+
 ```nim
-
 var styles = newStyles()
-styles.marginInline = {1.px, 2.px}  # compile-time validated
-styles.color  = "red"
-
-var dynamicValue = "5px"
-styles.paddingRight = dynamicValue
-styles.marginBlock  = {1.px, `dynamicValue`}
+styles.color = "red"
+styles.marginBlock = {1.px, 2.px}
 
 web:
   box:
     style styles
-    style:
-      color: red # multiple style tags work
 ```
 
-## Selectors and Advanced Styling
+---
+
+### Selectors
 
 ```nim
 web:
   p "Interactive element":
     class textElement
     style:
-      # Selectors create indepdent <style> tags
-      !textElement:  # Use ! instead of . for class selectors
+      !textElement:
         color: blue
-      
-      !textElement[hover]:  # Pseudo-classes
+      !textElement[hover]:
         color: darkBlue
-      
-      [root]:  # Root selector
+      [root]:
         backgroundColor: white
-    
-      # Property assignments apply to parent
-      "custom-property": "value"  # String property names supported
 ```
+
+* `!` = class selector
+* `[state]` = pseudo-classes
+
+---
 
 ## Components
 
-Components are regular Nim procedures that return HTML:
+### Basic Components
 
 ```nim
 proc Card(title: string, content: string): HTML =
   return web:
-    box:  # Use box instead of div (Nim keyword)
+    box:
       class "card"
       h2: title
       p: content
 
-# Usage
-let html = web:
+web:
   Card:
     title "Hello"
-    content "This is a card component"
+    content "This is a card"
 ```
 
-## Components with Children
+### Components with Children
 
 ```nim
 proc Container(children: HTML): HTML =
@@ -129,38 +151,37 @@ proc Container(children: HTML): HTML =
       class "container"
       children
 
-# Usage
-let html = web:
+web:
   Container:
     children:
-      h1 "Website Title"
-      p "Welcome to my site"
+      h1 "Title"
+      p "Body"
 ```
 
-## Attribute and Style Pass-through
-Passthrough an attribute to apply to the top-level of a component
+### Attribute & Style Passthrough
 
 ```nim
-let html = web:
+web:
   Card:
     title "Hello"
-    `id` "custom-card"  # Passthrough attribute
-    `style`:            # Passthrough styling
+    `id` "custom-card"
+    `style`:
       backgroundColor: blue
 ```
 
-## Component Name Conflicts
+### Component Name Conflicts
 
 ```nim
-proc p(content: string): HTML =  # Component with same name as HTML tag
+proc p(content: string): HTML =
   return web:
     box: content
 
-# Use backticks to specify the component
-let html = web:
-  `p`:  # Use component, not HTML tag
+web:
+  `p`:
     content "Custom paragraph"
 ```
+
+---
 
 ## Types
 
@@ -171,14 +192,28 @@ type HTMLNodeKind* = enum
 
 type HTMLNode* = object
   elementId*: string
-  
   case kind*: HTMLNodeKind
   of htmlnkElement:
     tag*: string
-    attributes*: Table[string, string] = initTable[string, string]()
-    children*: seq[HTMLNode] = @[]
+    attributes*: Table[string, string]
+    children*: seq[HTMLNode]
   of htmlnkText:
     text*: string
 
 type HTML* = seq[HTMLNode]
 ```
+
+---
+
+## Framework Integration
+
+The `web` package is built specifically for use inside the [Thing framework](https://github.com/thing-king/thing).
+
+* Style and component state remain tightly coupled.
+* Inline styles automatically generate scoped CSS classes — no manual class management required.
+* Global class usage is supported for external libraries but generally discouraged inside Thing projects.
+* Fully reactive state layer, lifecycle management, and DOM diffing handled by Thing core.
+
+---
+
+> `web` is a first-class HTML/CSS generation layer fully integrated into Thing’s self-hosted full-stack system.
