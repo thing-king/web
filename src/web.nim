@@ -10,7 +10,34 @@ export css
 export html
 
 const DO_VALIDATE = false
-const DO_LOG = true
+const DO_LOG = false
+
+
+proc excludeKey*(html: HTML, key: string): HTML =
+  return html.filter(HTMLNodeFilter(proc(node: HTMLNode): bool =
+    if node.kind != htmlnkElement:
+      return false
+    if not node.attributes.hasKey("element-id"):
+      return false
+    return node.attributes["element-id"] == key
+  ))
+
+proc excludeAttribute*(html: HTML, name: string, value: string): HTML =
+  return html.filter(HTMLNodeFilter(proc(node: HTMLNode): bool =
+    if node.kind != htmlnkElement:
+      return false
+    if not node.attributes.hasKey(name):
+      return false
+    return node.attributes[name] == value
+  ))
+proc excludeAttribute*(html: HTML, name: string): HTML =
+  return html.filter(HTMLNodeFilter(proc(node: HTMLNode): bool =
+    if node.kind != htmlnkElement:
+      return false
+    return node.attributes.hasKey(name)
+  ))
+proc excludeName*(html: HTML, name: string): HTML =
+  return html.excludeAttribute("name", name)
 
 
 const seperator*: string = "══════════════════════════════════════════════════"
@@ -48,51 +75,100 @@ const VOID_ELEMENTS = @[
 ]
 
 
-# TODO: this should not be a seperate loopo
-proc fixVoidElementsWithStyles*(nodes: seq[HTMLNode]): seq[HTMLNode] =
-  ## Post-processes HTML nodes to move <style> elements out of void elements
-  ## and validates that void elements don't have other invalid content
-  
-  result = @[]
-  
+proc toTableRef*[K, V](pairs: openArray[(K, V)]): TableRef[K, V] =
+  result = new(Table[K, V])
+  for pair in pairs:
+    result[pair[0]] = pair[1]
+proc newTableRef*[K, V](pairs: openArray[(K, V)]): TableRef[K, V] =
+  result = toTableRef(pairs)
+proc newTableRef*[K, V](): TableRef[K, V] =
+  result = new(Table[K, V])
+
+proc fixVoidElementsWithStyles*(nodes: seq[HTMLNode], componentName: string = "", isTopLevel: bool = true): seq[HTMLNode] =
+  result = newSeqOfCap[HTMLNode](nodes.len)
+
   for node in nodes:
-    case node.kind:
-    of htmlnkElement:
-      # Check if this is a void element with children
+    if node.kind == htmlnkElement:
       if node.tag in VOID_ELEMENTS and node.children.len > 0:
-        var extractedStyles: seq[HTMLNode] = @[]
-        
-        # Process children of void element
+        # Process children first
         for child in node.children:
           if child.kind == htmlnkElement and child.tag == "style":
-            # Extract style element
-            extractedStyles.add(child)
+            # Check if style tag has any content (non-empty text nodes)
+            var hasContent = false
+            for styleChild in child.children:
+              if styleChild.kind == htmlnkText and styleChild.text.strip().len > 0:
+                hasContent = true
+                break
+            
+            # Only add style elements that have content
+            if hasContent:
+              # Only set component-name on style elements if they don't have one AND we're at top level
+              if componentName.len > 0 and isTopLevel and (not child.attributes.hasKey("component-name") or child.attributes["component-name"] == nil or child.attributes["component-name"] == ""):
+                child.attributes["component-name"] = componentName
+              result.add(child)
           else:
-            # Error: void element has non-style content
             raise newException(ValueError, "Void element '" & node.tag & "' cannot contain content other than styles")
+
+        # Share the attributes reference instead of copying
+        let strippedVoidNode = new(HTMLNode)
+        strippedVoidNode.kind = htmlnkElement
+        strippedVoidNode.tag = node.tag
+        strippedVoidNode.attributes = node.attributes  # Share reference!
+        strippedVoidNode.children = @[]
         
-        # Add extracted styles first
-        result.add(extractedStyles)
-        
-        # Add the void element without children
-        var cleanVoidElement = node
-        cleanVoidElement.children = @[]
-        result.add(cleanVoidElement)
-      
+        # Build component name chain for void elements
+        if componentName.len > 0 and isTopLevel:
+          let existingName = if strippedVoidNode.attributes.hasKey("component-name") and strippedVoidNode.attributes["component-name"] != nil and strippedVoidNode.attributes["component-name"] != "": 
+            strippedVoidNode.attributes["component-name"] 
+          else: 
+            ""
+          strippedVoidNode.attributes["component-name"] = if existingName != "": 
+            componentName & "," & existingName 
+          else: 
+            componentName
+        result.add(strippedVoidNode)
       else:
-        # Not a void element or no children - process children recursively
-        var processedNode = node
-        if node.children.len > 0:
-          processedNode.children = fixVoidElementsWithStyles(node.children)
+        # For non-void elements, also share references
+        let processedNode = new(HTMLNode)
+        processedNode.kind = node.kind
+        case node.kind:
+        of htmlnkElement:
+          processedNode.tag = node.tag
+          processedNode.attributes = node.attributes  # Share reference!
+          if node.children.len > 0:
+            # Recursive call with isTopLevel = false to prevent overwriting nested component names
+            processedNode.children = fixVoidElementsWithStyles(node.children, componentName, false)
+          
+          # Check if this is an empty style tag and skip it
+          if processedNode.tag == "style":
+            var hasContent = false
+            for styleChild in processedNode.children:
+              if styleChild.kind == htmlnkText and styleChild.text.strip().len > 0:
+                hasContent = true
+                break
+            if not hasContent:
+              continue  # Skip adding this empty style tag
+              
+        of htmlnkText:
+          processedNode.text = node.text
+        
+        # Build component name chain for regular elements
+        if componentName.len > 0 and isTopLevel and node.kind == htmlnkElement:
+          let existingName = if processedNode.attributes.hasKey("component-name") and processedNode.attributes["component-name"] != nil and processedNode.attributes["component-name"] != "": 
+            processedNode.attributes["component-name"] 
+          else: 
+            ""
+          processedNode.attributes["component-name"] = if existingName != "": 
+            componentName & "," & existingName 
+          else: 
+            componentName
         result.add(processedNode)
-    
-    of htmlnkText:
-      # Text nodes are fine as-is
-      result.add(node)
+    else:
+      result.add(node)  # Text nodes - no copying needed
 
 type WebResponse = tuple[body: NimNode, eventHandlers: NimNode]
-proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles: seq[WrittenDocumentNode] = @[]): WebResponse =
-  var topElementId = thingUuid & ":" & thisUuid
+proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string): WebResponse =
+  var topElementId = thingUuid & "_" & thisUuid & "_dsl"
 
   # echo "HANDLING WEB WITH UUID"
   # echo thingUuid
@@ -102,24 +178,66 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
   var body = inputBody
 
 
-  type Result = object
-    node: NimNode
-    
-    attributeName: string = ""
-    attributeValue: NimNode
-    isQuotedAttribute: bool = false
+  type
+    StyleResultKind = enum
+      srkRUNTIME, srkCOMPILE_TIME
 
-    parentStyles: NimNode
+    StyleResult = object
+      isQuoted: bool = false
+      case kind: StyleResultKind
+      of srkRUNTIME:
+        style: NimNode
+      of srkCOMPILE_TIME:
+        properties: seq[WrittenDocumentNode]
+        rules: seq[WrittenDocumentNode]
+
+    Result = object
+      styleResult: Option[StyleResult] = none(StyleResult)
+
+      node: NimNode
+      attributeName: string = ""
+      attributeValue: NimNode
+      isQuotedAttribute: bool = false
+
 
   var elementCount = 0
   proc uniqueElementId(): int =
     elementCount += 1
     return elementCount
-
+  proc createComponentInstanceId(): NimNode =
+    let index = uniqueElementId()
+    let componentId = topElementId & "-" & $index
+    return nnkInfix.newTree(
+      ident("&"),
+      nnkInfix.newTree(
+        ident("&"),
+        ident("key"),
+        newStrLitNode("__")
+      ),
+      newStrLitNode(componentId)
+    )
 
   let eventHandlers = newStmtList()
 
-  proc createElement(tagName: string, attributes: Table[string, NimNode], children: seq[NimNode], isTopLevel: bool): NimNode =
+  proc createTextElement(strLit: NimNode): NimNode
+  proc createElement(tagName: string, attributes: Table[string, NimNode], styles: seq[StyleResult], rawChildren: seq[NimNode], isTopLevel: bool, standaloneStyle: bool = false): NimNode =
+    # add "element-id" attribute
+    let index = uniqueElementId()
+    var elementId = topElementId
+    # if not isTopLevel:
+    elementId &= "-" & $index
+    
+    let elementIdNode = nnkInfix.newTree(
+      ident("&"),
+      nnkInfix.newTree(
+        ident("&"),
+        ident("key"),
+        newStrLitNode("__")
+      ),
+      newStrLitNode(elementId)
+    )
+
+
     var fields = @[
       newTree(nnkExprColonExpr,
         newIdentNode("kind"),
@@ -127,16 +245,143 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
       ),
       newTree(nnkExprColonExpr,
         newIdentNode("tag"),
-        newStrLitNode(tagName)
+        newStrLitNode(if standaloneStyle: "style" else: tagName)
       )
     ]
     var modAttributes = attributes
-    # add "element-id" attribute
-    let index = uniqueElementId()
-    var elementId = topElementId
-    if not isTopLevel:
-      elementId &= "-" & $index
-    
+    # assign "element-id" attribute
+    modAttributes["element-id"] = elementIdNode
+
+    var children = rawChildren
+
+    var standaloneStyleContent: NimNode = newEmptyNode()
+    if styles.len > 0:
+      var stylesAttribute: NimNode = newEmptyNode()
+      var classAttribute: NimNode = newEmptyNode()
+      for styleResult in styles:
+        case styleResult.kind
+        of srkRUNTIME:
+          let styleValue = nnkCall.newTree(
+            ident("toStylesAttribute"),
+            styleResult.style
+          )
+          if stylesAttribute.kind == nnkEmpty:
+            stylesAttribute = styleValue
+          else:
+            stylesAttribute = nnkInfix.newTree(
+              ident("&"),
+              nnkInfix.newTree(
+                ident("&"),
+                stylesAttribute,
+                newStrLitNode("; ")
+              ),
+              styleValue
+            )
+          
+          let classValue = nnkCall.newTree(
+            ident("toClassAttribute"),
+            styleResult.style,
+            elementIdNode
+          )
+          if classAttribute.kind == nnkEmpty:
+            classAttribute = classValue
+          else:
+            classAttribute = nnkInfix.newTree(
+              ident("&"),
+              nnkInfix.newTree(
+                ident("&"),
+                classAttribute,
+                newStrLitNode(" ")
+              ),
+              classValue
+            )
+          let styleElementValue = nnkCall.newTree(
+            ident("toStylesElement"),
+            styleResult.style,
+            elementIdNode
+          )
+          if not standaloneStyle:
+            let styleElement = createElement("style", initTable[string, NimNode](), @[], @[
+              createTextElement(
+                styleElementValue
+              )
+            ], isTopLevel)
+            children.insert(styleElement, 0)
+          else:
+            if standaloneStyleContent.kind == nnkEmpty:
+              standaloneStyleContent = styleElementValue
+            else:
+              standaloneStyleContent = nnkInfix.newTree(
+                ident("&"),
+                nnkInfix.newTree(
+                  ident("&"),
+                  standaloneStyleContent,
+                  newStrLitNode(" ")
+                ),
+                styleElementValue
+              )
+
+        of srkCOMPILE_TIME:
+          let properties = styleResult.properties
+          let styleValue = properties.toStylesAttribute()
+          if styleValue.kind != nnkEmpty:
+            if stylesAttribute.kind == nnkEmpty:
+              stylesAttribute = styleValue
+            else:
+              stylesAttribute = nnkInfix.newTree(
+                ident("&"),
+                nnkInfix.newTree(
+                  ident("&"),
+                  stylesAttribute,
+                  newStrLitNode("; ")
+                ),
+                styleValue
+              )
+          let rules = styleResult.rules
+          let classValue = rules.toClassAttribute(elementIdNode)
+          if classValue.kind != nnkEmpty:
+            if classAttribute.kind == nnkEmpty:
+              classAttribute = classValue
+            else:
+              classAttribute = nnkInfix.newTree(
+                ident("&"),
+                nnkInfix.newTree(
+                  ident("&"),
+                  classAttribute,
+                  newStrLitNode(" ")
+                ),
+                classValue
+              )
+          let stylesheet = rules.toStylesElement(elementIdNode)
+          if stylesheet.kind != nnkEmpty:
+            if not standaloneStyle:
+              let styleElement = createElement("style", initTable[string, NimNode](), @[], @[
+                createTextElement(
+                  stylesheet
+                )
+              ], isTopLevel)
+              children.insert(styleElement, 0)
+            else:
+              if standaloneStyleContent.kind == nnkEmpty:
+                standaloneStyleContent = stylesheet
+              else:
+                standaloneStyleContent = nnkInfix.newTree(
+                  ident("&"),
+                  nnkInfix.newTree(
+                    ident("&"),
+                    standaloneStyleContent,
+                    newStrLitNode(" ")
+                  ),
+                  stylesheet
+                )
+
+      # Add style attributes
+      if stylesAttribute.kind != nnkEmpty:
+        modAttributes["style"] = stylesAttribute
+      if classAttribute.kind != nnkEmpty:
+        modAttributes["class"] = classAttribute
+    if standaloneStyle and standaloneStyleContent.kind != nnkEmpty:
+      children.insert(createTextElement(standaloneStyleContent), 0)
     # echo "Creating element: " & tagName & " with id: " & elementId
     
     var tuples = newTree(nnkBracket)
@@ -210,7 +455,7 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
           newIdentNode("@"),
           tuples
         ),
-        newIdentNode("toTable")
+        newIdentNode("toTableRef")
       )
       
       fields.add(
@@ -277,7 +522,7 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
       newTree(
         nnkExprColonExpr,
         ident("elementId"),
-        newStrLitNode(elementId)
+        elementIdNode
       )
     )
     
@@ -300,7 +545,8 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
       )
     )
   proc createBodyElement(node: NimNode): NimNode =
-    result = newCall(ident("toBody"), node)  
+    let componentInstanceId = createComponentInstanceId()
+    result = newCall(ident("toBody"), node, componentInstanceId)  
    
   proc isToBody(node: NimNode): bool =
     return node.kind == nnkCall and node[0].strVal == "toBody"
@@ -314,11 +560,15 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
       # otherwise- is a component
       let tagName = toElementName(node.strVal)
       if not htmlElements.hasKey(tagName):
+        # var componentCall = nnkCall.newTree(
+        #   ident(node.strVal),
+        # )
         return Result(node: createBodyElement(node)
         )
       else:
+        # echo ":: createElement #1  IDENT"
         return Result(
-          node: createElement(tagName, initTable[string, NimNode](), @[], isTopLevel)
+          node: createElement(tagName, initTable[string, NimNode](), @[], @[], isTopLevel)
         )
     
     of nnkAccQuoted:
@@ -353,144 +603,73 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
         else:
           isElement = false
       
-      if callNodeName == "style":
-        if node.len != 2:
-          error "expected only 2 arguments, got " & $node.len, node
-        
-        if not wasComponent:
-          # Handle style for HTML elements (create CSS and style elements)
-          if callValue.kind in {nnkIdent, nnkSym}:
-            # echo "IDENT DETECTED"
-            
-            # Generate both the style element and the class attribute
-            var nodeResult = Result()
-            
-            # Create the <style> element with the computed CSS
-            nodeResult.node = createElement("style", initTable[string, NimNode](), @[
-              createTextElement(
-                nnkCall.newTree(
-                  ident("computeClassesStr"),
-                  newStrLitNode("obj-" & thingUuid),
-                  callValue
-                )
-              )
-            ], isTopLevel)
-            
-            # Set the class attribute
-            nodeResult.attributeName = "class"
-            nodeResult.attributeValue = nnkCall.newTree(
-              ident("computeClasses"),
-              newStrLitNode("obj-" & thingUuid),
-              callValue
-            )
-            
-            nodeResult.isQuotedAttribute = isQuoted
-            return nodeResult
-          
-          if callValue.kind != nnkStmtList:
-            error "expected a stmt list, got " & $callValue.kind, callValue
+      if wasComponent:
+        isElement = false  # TODO: THIS COULD BREAK STUFF I HAVE NOT TESTED IT
 
-          let computedStylesDoc = computeStyles("non-" & thingUuid, callValue)
-          # echo "COMPUTING UUID: " & thingUuid
-
-          # echo "GOT COMPUTED STYLES DOC:"
-          # echo computedStylesDoc.treeRepr        
-          # Separate root-level properties from CSS selectors/rules
-          let (rootLevelProperties, cssSelectorsAndRules) = separateStyleContent(computedStylesDoc)
-          
-          # echo "ROOT LEVEL PROPERTIES: " & $rootLevelProperties.len
-          # echo "CSS SELECTORS/RULES: " & $cssSelectorsAndRules.len
+      if callNodeName == "target":
+        if not wasComponent or isQuoted:
+          # echo "IS ELEMENT OR QUOTED"
+          if node.len != 2:
+            error "expected only 2 arguments, got " & $node.len, node
+          if callValue.kind notin {nnkIdent, nnkSym}:
+            error "expected a target name (ident or sym), got " & $callValue.kind, callValue
 
           var nodeResult = Result()
-          
-          # Create <style> element if we have ANY styles (root properties OR selectors/rules)
-          if rootLevelProperties.len > 0 or cssSelectorsAndRules.len > 0:
-            # Use computeClassesStr on the original computedStylesDoc which handles both cases
-            let computedStr = computeClassesStr("non-" & thingUuid, computedStylesDoc)
-            # echo "Generated CSS: " & $computedStr
-            
-            nodeResult.node = createElement("style", initTable[string, NimNode](), @[
-              createTextElement(newStrLitNode($computedStr))
-            ], isTopLevel)
-          
-          # Set class attribute if there are root-level properties
-          if rootLevelProperties.len > 0:
-            nodeResult.attributeName = "class"
-            nodeResult.attributeValue = newStrLitNode(computeClasses("non-" & thingUuid, rootLevelProperties))
-          
+
+          nodeResult.attributeName = "id"
+          nodeResult.attributeValue = nnkPrefix.newTree(
+            ident("$"),
+            callValue
+          )
           nodeResult.isQuotedAttribute = isQuoted
           return nodeResult
-        else:
-          # Handle style for components - create a Styles object from the style block
+
+      # Handle style - BUT ONLY if we're dealing with CSS styling, not component parameters
+      if callNodeName == "style":
+        # Debug output to understand the context
+        # echo "Processing style: isElement=", isElement, ", wasComponent=", wasComponent, ", isTopLevel=", isTopLevel, ", elementName=", elementName
+        
+        # Only treat as CSS style if:
+        # 1. We're dealing with an HTML element (isElement = true), OR
+        # 2. We're at top level (for global styles)
+        # 3. We're NOT processing component parameters (wasComponent = false AND not isElement)
+        
+        let shouldTreatAsCSS = not wasComponent or isTopLevel
+        # echo "shouldTreatAsCSS=", shouldTreatAsCSS
+        
+        if shouldTreatAsCSS:
+          if node.len != 2:
+            error "expected only 2 arguments, got " & $node.len, node
+          
+          # Handle style for HTML elements (create CSS and style elements)
           if callValue.kind in {nnkIdent, nnkSym}:
-            # Pass through the identifier as-is (e.g., style styles2)
-            return Result(
-              attributeName: "style",
-              attributeValue: callValue,
-              isQuotedAttribute: isQuoted
-            )
-          
-          if callValue.kind != nnkStmtList:
-            error "expected a stmt list for component style, got " & $callValue.kind, callValue
-          
-          # For component style blocks, create a block that builds a Styles object
-          var stylesBlock = nnkBlockStmt.newTree(
-            newEmptyNode(),
-            nnkStmtList.newTree()
-          )
-          
-          let blockBody = stylesBlock[1]
-          
-          # Create the styles variable
-          blockBody.add nnkVarSection.newTree(
-            nnkIdentDefs.newTree(
-              ident("result"),
-              ident("Styles"),
-              nnkCall.newTree(ident("newStyles"))
-            )
-          )
-          
-          # Transform each style property in the block
-          for styleChild in callValue:
-            case styleChild.kind:
-            of nnkCall:
-              if styleChild.len == 2:
-                let propName = styleChild[0]
-                let propValue = styleChild[1]
-                
-                # Create assignment: result.propName = propValue
-                blockBody.add nnkAsgn.newTree(
-                  nnkDotExpr.newTree(ident("result"), propName),
-                  propValue
-                )
-            of nnkExprColonExpr:
-              let propName = styleChild[0]
-              let propValue = styleChild[1]
+            var nodeResult = Result()
+            nodeResult.styleResult = some(StyleResult(
+              kind: srkRUNTIME,
+              isQuoted: isQuoted,
+              style: callValue
+            ))
+            return nodeResult
               
-              # Create assignment: result.propName = propValue
-              blockBody.add nnkAsgn.newTree(
-                nnkDotExpr.newTree(ident("result"), propName),
-                propValue
-              )
-            else:
-              # For other node types, try to process them as well
-              blockBody.add styleChild
-          
-          # Return the result
-          blockBody.add ident("result")
-          
-          return Result(
-            attributeName: "style",
-            attributeValue: stylesBlock,
-            isQuotedAttribute: isQuoted
-          )
+          # Handle compile-time styles
+          let (properties, rules) = parseWrittenDocument(callValue).split()
+          var nodeResult = Result()
+          nodeResult.styleResult = some(StyleResult(
+            kind: srkCOMPILE_TIME,
+            isQuoted: isQuoted,
+            properties: properties,
+            rules: rules
+          ))
+          return nodeResult
+
+        
 
 
       var body:    NimNode = newEmptyNode()
       var textArg: NimNode = newEmptyNode()
       if callValue.kind == nnkStmtList:
         if node.len != 2:
-          error "expected only 2 arguments, got " & $node.len, node
+          error "expected only 2 arguments, got " & $node.len & "\n\n" & node.treeRepr, node
 
         body      = callValue
       # TODO: here
@@ -516,6 +695,7 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
           children.add createTextElement(textArg)
 
         var attributes: Table[string, NimNode] = initTable[string, NimNode]()
+        var styles: seq[StyleResult] = @[]
         var passthroughAttributes: seq[NimNode] = @[]
         # var passthroughEvents: seq[NimNode] = @[]
 
@@ -524,10 +704,16 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
 
         # echo "HERE: " & callNodeName & " is " & $wasComponent
         for child in body:
-         
-          # echo "PROCESSING"
-          # echo child.treeRepr
-          let childResult = process(child, false, not isElement)
+          let childWasComponent = if wasComponent and not isElement:
+            false  # This is a component parameter block containing HTML
+          else:
+            not isElement
+          let childResult = process(child, false, childWasComponent)
+          if childResult.styleResult.isSome:
+            let styleResult = childResult.styleResult.get()
+            # echo "Adding to styles!"
+            styles.add(styleResult)
+
           # echo "Got child result: " & childResult.repr
           # if is element, expect all: elements, components, or attributes
           # if not is element, expect component inputs and passthrough attributes
@@ -537,39 +723,39 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
               # echo "Found child node: " & childResult.node.repr & " : " & child.repr
               children.add(childResult.node)
             
-            if childResult.attributeName == "style":
-              if childResult.isQuotedAttribute:
-                error "Passthrough attributes are not allowed for elements", childResult.attributeValue
+            # if childResult.attributeName == "style":
+            #   if childResult.isQuotedAttribute:
+            #     error "Passthrough attributes are not allowed for elements", childResult.attributeValue
 
-              var existingValue: NimNode = newEmptyNode()
-              if attributes.hasKey(childResult.attributeName):
-                existingValue = attributes[childResult.attributeName]
+            #   var existingValue: NimNode = newEmptyNode()
+            #   if attributes.hasKey(childResult.attributeName):
+            #     existingValue = attributes[childResult.attributeName]
 
-              var newValue = childResult.attributeValue
-              if newValue.kind == nnkIdent:
-                newValue = nnkCall.newTree(
-                  ident("$"),
-                  newValue,
-                )
-              # echo "ADDINGGGGG "
-              # echo "EXISTING: " & existingValue.repr
-              # echo "NEW: " & newValue.repr
-              if existingValue.kind != nnkEmpty:
-                existingValue = nnkInfix.newTree(
-                  ident("&"),
-                  existingValue,
-                  newStrLitNode("; "),
-                )
-                existingValue = nnkInfix.newTree(
-                  ident("&"),
-                  existingValue,
-                  newValue,
-                )
-              else:
-                existingValue = newValue
-              attributes[childResult.attributeName] = existingValue
-            
-            elif childResult.attributeName != "":
+            #   var newValue = childResult.attributeValue
+            #   if newValue.kind == nnkIdent:
+            #     newValue = nnkCall.newTree(
+            #       ident("$"),
+            #       newValue,
+            #     )
+            #   # echo "ADDINGGGGG "
+            #   # echo "EXISTING: " & existingValue.repr
+            #   # echo "NEW: " & newValue.repr
+            #   if existingValue.kind != nnkEmpty:
+            #     existingValue = nnkInfix.newTree(
+            #       ident("&"),
+            #       existingValue,
+            #       newStrLitNode("; "),
+            #     )
+            #     existingValue = nnkInfix.newTree(
+            #       ident("&"),
+            #       existingValue,
+            #       newValue,
+            #     )
+            #   else:
+            #     existingValue = newValue
+            #   attributes[childResult.attributeName] = existingValue
+
+            if childResult.attributeName != "":
               if childResult.isQuotedAttribute:
                 error "Passthrough attributes are not allowed for elements", childResult.attributeValue
               
@@ -591,8 +777,11 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
                   )
                 else:
                   attributes[childResult.attributeName] = childResult.attributeValue
+                
+                
 
               else:
+
                 if attributes.hasKey(childResult.attributeName):
                   error "Duplicate attribute: " & childResult.attributeName, childResult.attributeValue
                 
@@ -660,7 +849,19 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
 
                 # wasComponentSeq[1].add(childResult.node)
               else:
-                error "Unexpected node for component, expect inputs only: " & $childResult.node.kind, childResult.node
+                # error "Unexpected node for component, expect inputs only: " & $childResult.node.kind & "\n" & childResult.node.treeRepr, childResult.node
+                error "Unexpected node for component, expects inputs only, got: " & $childResult.node.kind & "\n\nThis was likely parsed as a element." & "\n" & childResult.repr, childResult.node
+            # if childResult.class != nil and childResult.class.kind != nnkEmpty:
+            #   # echo "Found class: " & childResult.class.repr
+            #   if attributes.hasKey("class"):
+            #     attributes["class"] = nnkInfix.newTree(
+            #       ident("&"),
+            #       attributes["class"],
+            #       childResult.class
+            #     )
+            #   else:
+            #     attributes["class"] = childResult.class
+            
             if childResult.attributeName != "":
               # if isQuoted: passthrough attribute
               #   otherwise: is a component input
@@ -698,7 +899,6 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
                 # echo childResult.attributeValue.repr
         
         # echo "GOT HERE: " & callNodeName & " : " & $isElement'
-
 # Fix for the component processing logic
 # Replace the section starting with "# echo "GOT HERE: " & callNodeName & " : " & $isElement"
 
@@ -706,10 +906,11 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
         
         # Check if this is an HTML element first, regardless of component context
         if isElement:
+          # echo ":: createElement #2  CALL"
+          # echo styles.len
           return Result(
-            node: createElement(elementName, attributes, children, isTopLevel)
+            node: createElement(elementName, attributes, styles, children, isTopLevel)
           )
-        
         # If not an HTML element and we're in a component context
         if wasComponent:
           log "wasComponent, giving back: " & callNodeName
@@ -724,6 +925,13 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
             
             var componentCall = nnkCall.newTree(
               newIdentNode(callNodeName),
+            )
+
+            componentCall.add(
+              nnkExprEqExpr.newTree(
+                ident("key"),
+                createComponentInstanceId()
+              )
             )
             
             # Add regular attributes
@@ -744,7 +952,6 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
                 )
               )
             
-            # Wrap with passthrough attributes
             componentCall = nnkCall.newTree(
               ident("addPassthroughAttributes"),
               componentCall,
@@ -756,7 +963,7 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
                       passthroughAttributes
                     )
                   ),
-                  ident("toTable")
+                  ident("toTableRef")
                 )
               )
             )
@@ -764,7 +971,8 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
             return Result(
               node: nnkCall.newTree(
                 ident("toBody"),
-                componentCall
+                componentCall,
+                newStrLitNode("")
               )
             )
           
@@ -773,6 +981,12 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
             # Only create component calls for non-HTML elements
             var componentCall = nnkCall.newTree(
               newIdentNode(callNodeName),
+            )
+            componentCall.add(
+              nnkExprEqExpr.newTree(
+                ident("key"),
+                createComponentInstanceId()
+              )
             )
             for inputName, inputValue in attributes:
               componentCall.add(
@@ -785,7 +999,8 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
             return Result(
               node: nnkCall.newTree(
                 ident("toBody"),
-                componentCall
+                componentCall,
+                newStrLitNode("")
               )
             )
           
@@ -797,8 +1012,15 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
         # If not an element and not in component context, treat as standalone component
         else:
           # TODO: do type checking, import
+
           var componentCall = nnkCall.newTree(
             newIdentNode(callNodeName),
+          )
+          componentCall.add(
+            nnkExprEqExpr.newTree(
+              ident("key"),
+              createComponentInstanceId()
+            )
           )
 
           for inputName, inputValue in attributes:
@@ -822,7 +1044,7 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
                       passthroughAttributes
                     )
                   ),
-                  ident("toTable")
+                  ident("toTableRef")
                 )
               )
             )
@@ -832,49 +1054,6 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
           return Result(
             node: createBodyElement(componentCall)
           )
-
-        if isElement:
-          return Result(
-            node: createElement(elementName, attributes, children, isTopLevel)
-          )
-        else:
-          # TODO: do type checking, import
-          var componentCall = nnkCall.newTree(
-            newIdentNode(callNodeName),
-          )
-
-          for inputName, inputValue in attributes:
-            componentCall.add(
-              newTree(nnkExprEqExpr,
-                ident(inputName),
-                inputValue
-              )
-            )
-
-          # echo "CALL: " & componentCall.repr
-
-          if passthroughAttributes.len > 0:
-            # echo "#2 WRAPPING COMPONENT WITH PASSTHROUGH ATTRIBUTES: ", passthroughAttributes.len
-            componentCall = nnkCall.newTree(
-              ident("addPassthroughAttributes"),
-              componentCall,
-              nnkCall.newTree(
-                nnkDotExpr.newTree(
-                  nnkPrefix.newTree(
-                    ident("@"),
-                    nnkBracket.newTree(
-                      passthroughAttributes
-                    )
-                  ),
-                  ident("toTable")
-                )
-              )
-            )
-
-          return Result(
-            node: createBodyElement(componentCall)
-          )
-      
 
       if textArg.kind != nnkEmpty:
         # is attribute of callNodeName
@@ -882,8 +1061,9 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
         
         # if element name- this is the inside text
         if isElement:
+          # echo ":: createElement #4  TEXT"
           return Result(
-            node: createElement(elementName, initTable[string, NimNode](), @[
+            node: createElement(elementName, initTable[string, NimNode](), @[], @[
               createTextElement(textArg)
             ], isTopLevel)
           )
@@ -941,9 +1121,14 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
         )
     else:
       if resultBody.kind == nnkEmpty:
+        var childNode: NimNode = childResult.node
+        if childNode.kind == nnkNilLit and childResult.styleResult.isSome:
+          let styles = @[childResult.styleResult.get()]
+          childNode = createElement("nil", initTable[string, NimNode](), styles, @[], true, true)
+
         resultBody = nnkPrefix.newTree(
           ident("@"),
-          newTree(nnkBracket, childResult.node)
+          newTree(nnkBracket, childNode)
         )
       elif resultBody.kind == nnkPrefix and resultBody[0].strVal == "@":
         resultBody[1].add(childResult.node)
@@ -1019,10 +1204,15 @@ proc handleWeb*(inputBody: NimNode, thingUuid: string, thisUuid: string, styles:
 
   let wrappedBody = nnkCall.newTree(
     ident("fixVoidElementsWithStyles"),
-    resultBody
+    resultBody,
+    newStrLitNode(thingUuid)
   )
   return (wrappedBody, eventHandlers)
 
+
+# TODO:
+#  1.  Add fixVoidElementsWithStyles
+#  2.  Re-integrate styles
 
 
 macro web*(body: untyped): untyped =
@@ -1115,137 +1305,92 @@ macro addPassthroughAttributes*(body: untyped, passthroughAttributes: untyped): 
 
       resultBody
 
+# Add the computeDirectStyles function that will be called by the generated code
+proc computeDirectStyles*(styles: auto): string =
+  ## Extract direct styles from a Styles object and format them as inline CSS
+  when styles is Styles:
+    return $styles.direct
+  else:
+    return ""
+
 when isMainModule:
+  let key = "test"
 
-
-  # # let htmlss = HTML(@[HTMLNode(
-  # #   kind: htmlnkText,
-  # #   text: "Hello World!"
-  # # )])
-  # proc row(children: HTML): HTML =
-  #   return web:
-  #     box:
-  #       name "row"
-  #       children
-
-  # proc tile(num: Option[int] = none(int)): HTML =
-  #   var tileText = "Tile " & $num
-  #   return web:
-  #     p:
-  #       tileText
-  #     # children
-  
-  # proc onclickhandler(): void =
-  #   echo "Clicked!"
-  #   # echo event
-  
-
-  # let content = web:
-  #   p "Hello world":
-  #     name "helloWorld"
-
-  # let htmls = web:
-  
-    
-
-  #   box:
-  #     name "box"
-  #     content
-
-
-  #     # onclick onclickhandler
-  #     # row:
-  #     #   children:
-  #     #     tile:
-  #     #       num some(5)
-  #     #     tile
-  #     #     tile
-  #     #     tile
-
-  #   # component:
-  #   #   children:
-  #   #     h1 "Testing!"
-  #   #     aNumber:
-  #   #       children:
-  #   #         h2 "Done!"
-
-  #         # aNumber:
-  #         #   children:
-  #         #     h1 "Hello world"
-  #           # number some(42)
-  #       # number some(5)
-  #       # `anAttribute` "hello world"
-  #       # `style`:
-  #         # color: orange
-  #       # children:
-  #       #   htmlss
-  #       #   htmlss
-  #       #   htmlss
-
-  #     # p "Test"
-  #       # anything:
-  #         # h2 "An H2!"
-  #         # h3 "An H333"
-
-
-
-
-
-
-  import thing/thing_seed/src/thing_seed/dom
-
-  # var styles = newStyles()
-  # styles.color = "red"
-  proc aComponent(): HTML =
+  proc aComponent(key: string = ""): HTML =
     return web:
-      box:
-        name "aComponent"
-        p "Hello world!"
+      p "A Component!"
 
-  proc mouseEntered(event: Event): void =
-    echo "Mouse entered on aComponent with event: " & event.repr
+  var styles = newStyles()
+  styles.color = "red"
 
   let htmls = web:
-
     box:
-      onmouseenter mouseEntered
+      name "stuff!"
 
-      aComponent:
-        `onmouseenter` mouseEntered
-        # `id` "someId!"
-        # `onmouseenter` mouseEntered
-
-    # h1 "Hello world"
-    # aComponent:
-    #   children:
-    #     p:
-    #       "Hello world!"
-        # p "This is a paragraph inside the component"
-        # p "This is
+      aComponent
+  
+  echo $htmls
 
 
-    # globalStyles
-      # aComponent:
-      #   text "Hello from aComponent"
-      #   `id` "this gets passed through fine, this works!"
-        # `style` styles2
-        # `style` styles2
-        # `test` "Test attribute"
-        # `style`:
-          # color: "blue"
+  # TODO: Try :root and pseudo-root-level styles
 
-        # @keyframes test:
-        #   "to":
-        #     transform: scale(2)
-      # style styles
+  # var styles1 = newStyles()
+  # styles1.color = "red"
 
-  log "Final HTML:"
-  log htmls.treeRepr
-  log $htmls
+  # let dynamicColor = "magenta"
+  # styles1.backgroundColor = `dynamicColor`
 
 
+  # var styles2 = newStyles()
+  # styles2.color = "blue"
+  # styles2.add:
+  #   [hover]:
+  #     opacity: 0.8
+  #   [hover, active]:
+  #     backgroundColor: `dynamicColor`
 
+  #   body:
+  #     backgroundColor: "yellow"
 
+  #   [root]:
+  #     backgroundColor: "black"
 
+  # proc aComponent(id: string, children: HTML): HTML =
+  #   return web:
+  #     p "This is a component!"
 
+  # let htmls = web:
+  #   aComponent:
+  #     `name` "name!!"
+  #     id "testing!"
+  #     children:
+  #       p "test"
+  #   box:
+  #     # p "Runtime test":
+  #     #   style styles1
+  #     # p "Compile-time test":
+  #     #   style:
+  #     #     color: orange
+  #     #     backgroundColor: `dynamicColor`
 
+  #     p "Runtime test with styles":
+  #       style styles2
+      # p "Compile-time test with styles":
+      #   style:
+      #     [hover]:
+      #       opacity: 0.2
+      #     [hover, active]:
+      #       backgroundColor: `dynamicColor`
+      #     body:
+      #       backgroundColor: "green"
+
+  # let htmls = web:
+  #   # p "Test"
+  #   style:
+  #     body:
+  #       color: red
+  #   style:
+  #     [root]:
+  #       backgroundColor: black
+
+  # echo htmls

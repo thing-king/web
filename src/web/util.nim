@@ -24,33 +24,24 @@ proc concat*(node: NimNode, other: NimNode): NimNode =
   )
 
 # TODO: rename `toBody` to something more fitting
-proc toBody*(body: string): seq[HTMLNode] {.gcsafe.} =
+proc toBody*(body: string, key: string): seq[HTMLNode] {.gcsafe.} =
   return @[HTMLNode(kind: htmlnkText, text: body)]
 
-proc toBody*(body: HTML): seq[HTMLNode] {.gcsafe.} =
+proc toBody*(body: HTML, key: string): seq[HTMLNode] {.gcsafe.} =
   return body
-  # # if body has some <style> tag nested- move to root
-  # # echo "toBody: ", body
-  
-  # var styles: seq[HTMLNode] = @[]
-  # var styleElementIds: seq[string] = @[]
-  # result = walk(body, proc(node: HTMLNode): Option[HTMLNode] =
-  #   case node.kind
-  #   of htmlnkElement:
-  #     if node.tag == "style":
-  #       # if node.elementId notin styleElementIds:
-  #       styles.add node
-  #       styleElementIds.add node.elementId
-  #       return none(HTMLNode)
-  #   else:
-  #     discard
-  #   return some(node)
-  # )
-  # result = styles & result
 
-template toBody*(prc: untyped): seq[HTMLNode] =
-  toBody(prc())
+template toBody*(prc: untyped, keys: string): seq[HTMLNode] =
+  toBody(prc(key = keys), keys)
 
+
+
+# proc toBody*(body: var HTML, key: string): seq[HTMLNode] {.gcsafe.} =
+#   filterEmptyStylesInPlace(body)
+#   return body
+
+# template toBody*(prc: untyped, key: string): seq[HTMLNode] =
+#   var result = prc(key)
+#   toBody(result, key)
 
 proc getAttr*[T](opt: Option[T]): T =
   if opt.isSome:

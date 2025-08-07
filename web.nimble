@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.26"
+version       = "0.1.27"
 author        = "savannt"
 description   = "Macro-based HTML generation/templating with CSS validation"
 license       = "MIT"

@@ -1,5 +1,7 @@
 import macros
-import strutils, tables, options
+import strutils, sequtils, tables, options
+
+import times
 
 import html
 export html
@@ -14,12 +16,29 @@ import essentials
 const LOG_ENABLED = false
 macro logState(args: varargs[untyped]): untyped =
   when LOG_ENABLED:
+    proc toStrLit(node: NimNode): NimNode =
+      if node.kind == nnkStrLit:
+        return node
+      else:
+        return nnkPrefix.newTree(
+          ident("$"),
+          node
+        )
+    var node = toStrLit(args[0])
+    if args.len > 1:
+      for i in 1..<args.len:
+        node = nnkInfix.newTree(
+          ident("&"),
+          nnkInfix.newTree(
+            ident("&"),
+            node,
+            newStrLitNode(",  ")
+          ),
+          toStrLit(args[i])
+        )
     return quote do:
       block:
-        var msg = ""
-        for arg in `args`:
-          msg &= $arg & " "
-        echo msg
+        echo `node`
   else:
     return newEmptyNode()
 
@@ -31,7 +50,12 @@ when defined(js):
   {.emit: """
   window.stateLog = function(...args) {
     if (window._state_log_enabled) {
-      console.log('[StateLog]', ...args);
+      const convertedArgs = args.map(arg =>
+        Array.isArray(arg) && arg.every(n => Number.isInteger(n)) 
+          ? String.fromCharCode(...arg)
+          : arg
+      );
+      console.log('[StateLog]', ...convertedArgs);
     }
   };
   """}
@@ -41,6 +65,57 @@ when defined(js):
 proc getBuiltinJS*(): string =
   return """
 window._eventListeners = [];
+window._initializedStateComponentInstances = new Map();
+window._initializedEffectComponentInstances = new Map();
+
+window.isComponentInstanceStateInitialized = function (rawComponentInstanceId, rawStateKey) {
+  let componentInstanceId = String.fromCharCode(...rawComponentInstanceId);
+  let stateKey = String.fromCharCode(...rawStateKey);
+
+  // if window._state already has an entry, return true (ssr initialized)
+  if (window._state && window._state[rawComponentInstanceId] && window._state[rawComponentInstanceId][rawStateKey] !== undefined) {
+    return true;
+  }
+
+  if(window._initializedStateComponentInstances.has(componentInstanceId)) {
+    let stateKeys = window._initializedStateComponentInstances.get(componentInstanceId);
+    if (stateKeys && stateKeys.has(stateKey)) {
+      return true;
+    }
+  }
+  return false;
+};
+window.isComponentInstanceEffectInitialized = function (rawComponentInstanceId, rawEffectId) {
+  let componentInstanceId = String.fromCharCode(...rawComponentInstanceId);
+  let effectId = String.fromCharCode(...rawEffectId);
+
+  if(window._initializedEffectComponentInstances.has(componentInstanceId)) {
+    let effectIds = window._initializedEffectComponentInstances.get(componentInstanceId);
+    if (effectIds && effectIds.has(effectId)) {
+      return true;
+    }
+  }
+  return false;
+};
+window.setComponentInstanceStateInitialized = function (rawComponentInstanceId, rawStateKey) {
+  let componentInstanceId = String.fromCharCode(...rawComponentInstanceId);
+  let stateKey = String.fromCharCode(...rawStateKey);
+
+  if (!window._initializedStateComponentInstances.has(componentInstanceId)) {
+    window._initializedStateComponentInstances.set(componentInstanceId, new Set());
+  }
+  window._initializedStateComponentInstances.get(componentInstanceId).add(stateKey);
+};
+window.setComponentInstanceEffectInitialized = function (rawComponentInstanceId, rawEffectId) {
+  let componentInstanceId = String.fromCharCode(...rawComponentInstanceId);
+  let effectId = String.fromCharCode(...rawEffectId);
+
+  if (!window._initializedEffectComponentInstances.has(componentInstanceId)) {
+    window._initializedEffectComponentInstances.set(componentInstanceId, new Set());
+  }
+  window._initializedEffectComponentInstances.get(componentInstanceId).add(effectId);
+};
+
 
 const originalAddEventListener = window.addEventListener;
 const originalRemoveEventListener = window.removeEventListener;
@@ -201,12 +276,21 @@ window.removeComponentDOMEventListeners = function (componentInstanceId) {
 })();
 """
 
-var pageComponent* {.used, threadvar.}: Option[proc(): HTML]
+const DEFAULT_KEY* {.used.} = "page"
+var pageComponent* {.used, threadvar.}: Option[proc(key: string = ""): HTML]
 var pageComponentName* {.used, threadvar.}: string
+var lastRender* {.used, threadvar.}: HTML
+var lastRenderTime* {.used, threadvar.}: int64
+
+proc getLastRender*(): HTML =
+  return lastRender
+proc getLastRenderTime*(): int64 =
+  return lastRenderTime
+
 proc clearPageComponent*() =
-  pageComponent = none(proc(): HTML)
+  pageComponent = none(proc(key: string = ""): HTML)
   pageComponentName = ""
-proc setPageComponent*(component: proc(): HTML, name: string) =
+proc setPageComponent*(component: proc(key: string = ""): HTML, name: string) =
   pageComponent = some(component)
   pageComponentName = name
 
@@ -240,19 +324,24 @@ proc getMemoValues*(): Table[string, (string, seq[string])] =
 
 
 
-proc stateInitEnabled*(): bool =
-  when defined(js):
-    {.emit: "return window._state_init_enabled"}
-  else:
-    # TODO: ?
-    return true
-proc eventInitEnabled*(): bool =
-  when defined(js):
-    {.emit: "return window._event_init_enabled"}
-  else:
-    # TODO: ?
-    return true
+# proc stateInitEnabled*(componentInstanceId: string): bool =
+#   when defined(js):
+#     {.emit: "return !window.isComponentInstanceStateInitialized(`componentInstanceId`);"}
+#   else:
+#     # TODO: ?
+#     return true
 
+proc eventInitialized(componentInstanceId: string, effectId: string): bool =
+  when defined(js):
+    {.emit: "return window.isComponentInstanceEffectInitialized(`componentInstanceId`, `effectId`);".}
+  else:
+    # TODO: ?
+    return true
+proc setEventInitialized(componentInstanceId: string, effectId: string) =
+  when defined(js):
+    {.emit: "window.setComponentInstanceEffectInitialized(`componentInstanceId`, `effectId`);".}
+  else:
+    discard
 
 
 
@@ -273,46 +362,210 @@ proc useMemo*[T](componentInstanceId: string, key: string, callback: Procedure[p
     return 0
 
 
-var effectListeners* {.used, threadvar.}: Table[string, Table[string, seq[(EventTarget, string, proc(ev: Event))]]]
+type Target* = object
+  id*: string
+
+
+var effectListeners* {.used, threadvar.}:       Table[string, Table[string, seq[(EventTarget, string, proc(ev: Event))]]]
+# var targetListeners* {.used, threadvar.}: Table[string, Table[string, Table[string, seq[(Target, proc(ev: Event))]]]]
+# var targetListenersCreated* {.used, threadvar.}: Table[string, Table[string, seq[string]]]
+var targetEffectListeners* {.used, threadvar.}: Table[string, Table[string, Table[string, seq[(Target, proc(ev: Event))]]]]
+var registeredTargetEvents* {.used, threadvar.}: seq[string]
 proc initEffectListeners() =
   effectListeners = initTable[string, Table[string, seq[(EventTarget, string, proc(ev: Event))]]]()
+  
+  registeredTargetEvents = @[]
+  targetEffectListeners = initTable[string, Table[string, Table[string, seq[(Target, proc(ev: Event))]]]]()
+
+  # targetListeners = initTable[string, Table[string, Table[string, seq[(Target, proc(ev: Event))]]]]()
+  # targetListenersCreated = initTable[string, Table[string, seq[string]]]()
 initEffectListeners()
-proc addEventListener*(componentId: string, effectId: string, et: EventTarget, ev: string, cb: proc(ev: Event), useCapture: bool = false) =
-  if not effectListeners.hasKey(effectId):
-    effectListeners[effectId] = initTable[string, seq[(EventTarget, string, proc(ev: Event))]]()
-  if not effectListeners[effectId].hasKey(componentId):
-    effectListeners[effectId][componentId] = @[]
-  effectListeners[effectId][componentId].add((et, ev, cb))
-  et.addEventListener(ev, cb, useCapture)
-proc addEventListener*(componentId: string, effectId: string, et: EventTarget, ev: string, cb: proc (ev: Event), options: AddEventListenerOptions) =
-  if not effectListeners.hasKey(effectId):
-    effectListeners[effectId] = initTable[string, seq[(EventTarget, string, proc(ev: Event))]]()
-  if not effectListeners[effectId].hasKey(componentId):
-    effectListeners[effectId][componentId] = @[]
-  effectListeners[effectId][componentId].add((et, $ev, cb))
-  et.addEventListener(ev, cb, options)
-proc clearEffectEventListeners(componentId: string, effectId: string) =
+
+var intervals* {.used, threadvar.}: Table[string, Table[string, seq[Interval]]]
+var timeouts*  {.used, threadvar.}: Table[string, Table[string, seq[TimeOut]]]
+proc initIntervals() =
+  intervals = initTable[string, Table[string, seq[Interval]]]()
+proc initTimeouts() =
+  timeouts = initTable[string, Table[string, seq[TimeOut]]]()
+initIntervals()
+initTimeouts()
+
+# var targetIds* {.used, threadvar.}: Table[string, string]
+# var targets* {.used, threadvar.}: Table[string, Element]
+# proc initTargets*() =
+#   targets = initTable[string, Element]()
+#   targetIds = initTable[string, string]()
+# initTargets()
+# proc useTarget*(componentInstanceId: string, targetId: string): Target =
+#   # only on initialization
+  
+#   # TODO:  SSR  ID generated vs client ID will differ
+#   if eventInitEnabled(componentInstanceId):
+#     if targetIds.hasKey(componentInstanceId & "-" & targetId):
+#       # echo "Using cached target ID for: ", componentInstanceId, "-", targetId & " -> ", targetIds[componentInstanceId & "-" & targetId]
+#       result.id = targetIds[componentInstanceId & "-" & targetId]
+#     else:
+#       result.id = $fastHash(componentInstanceId & "-" & targetId)
+#       echo "Creating new target ID for: ", componentInstanceId, "-", targetId & " -> ", result.id
+#       targetIds[componentInstanceId & "-" & targetId] = result.id
+#   else:
+#     if not targetIds.hasKey(componentInstanceId & "-" & targetId):
+#       raise newException(ValueError, "Target not found, useTarget not called during initialization... this should never happen.")
+#     result.id = targetIds[componentInstanceId & "-" & targetId]
+#     # raise newException(ValueError, "useTarget called but we are not in initialization mode")
+
+proc value*(target: Target): Element =
+  let el = document.getElementById(target.id)
+  if el == nil:
+    raise newException(ValueError, "Target not found: " & target.id)
+  return el
+converter toElement*(target: Target): Element =
+  return target.value()
+converter toEventTarget*(target: Target): EventTarget =
+  return cast[EventTarget](target.value())
+converter toNode*(target: Target): Node =
+  return cast[Node](target.value())
+converter toString*(target: Target): string =
+  return target.id
+proc `$`*(target: Target): string =
+  return target.id
+proc selector*(target: Target): string =
+  return "[id='" & target.id & "']"
+proc toSelector*(target: Target): string =
+  return target.selector()
+
+
+
+proc setAttribute*(node: var HTMLNode, name: string, value: string) =
+  if node.attributes.isNil:
+    node.attributes = new(Table[string, string])
+  node.attributes[name] = value
+proc setTarget*(node: var HTMLNode, target: Target) =
+  node.setAttribute("id", $target)
+
+
+
+when defined(js):
+  proc setInterval*(componentId: string, effectId: string, action: proc(), ms: int): Interval =
+    if not intervals.hasKey(componentId):
+      intervals[componentId] = initTable[string, seq[Interval]]()
+    if not intervals[componentId].hasKey(effectId):
+      intervals[componentId][effectId] = @[]
+    
+    let interval = dom.setInterval(action, ms)
+    intervals[componentId][effectId].add(interval)
+    return interval
+  proc setTimeout*(componentId: string, effectId: string, action: proc(), ms: int): TimeOut =
+    if not timeouts.hasKey(componentId):
+      timeouts[componentId] = initTable[string, seq[TimeOut]]()
+    if not timeouts[componentId].hasKey(effectId):
+      timeouts[componentId][effectId] = @[]
+    
+    let timeout = dom.setTimeout(action, ms)
+    timeouts[componentId][effectId].add(timeout)
+    return timeout
+  # proc setInterval*(componentId: string, effectId: string, action: proc(), ms: int) =
+  #   discard setInterval(componentId, effectId, action, ms)
+  # proc setTimeout*(componentId: string, effectId: string, action: proc(), ms: int) =
+  #   discard setTimeout(componentId, effectId, action, ms)
+  proc addEventListener*(componentId: string, effectId: string, et: EventTarget, ev: string, cb: proc(ev: Event), useCapture: bool = false) =
+    if not effectListeners.hasKey(effectId):
+      effectListeners[effectId] = initTable[string, seq[(EventTarget, string, proc(ev: Event))]]()
+    if not effectListeners[effectId].hasKey(componentId):
+      effectListeners[effectId][componentId] = @[]
+    effectListeners[effectId][componentId].add((et, ev, cb))
+    et.addEventListener(ev, cb, useCapture)
+  proc addEventListener*(componentId: string, effectId: string, et: EventTarget, ev: string, cb: proc (ev: Event), options: AddEventListenerOptions) =
+    if not effectListeners.hasKey(effectId):
+      effectListeners[effectId] = initTable[string, seq[(EventTarget, string, proc(ev: Event))]]()
+    if not effectListeners[effectId].hasKey(componentId):
+      effectListeners[effectId][componentId] = @[]
+    effectListeners[effectId][componentId].add((et, $ev, cb))
+    et.addEventListener(ev, cb, options)
+  
+
+  const NON_BUBBLE_EVENTS = [
+    "mouseenter", "mouseleave",
+    "focus", "blur",
+    "load", "unload",
+    "beforeunload",
+    "error",
+    "abosrt",
+    "loadstart",
+    "loadend",
+    "progress",
+    "invalid",
+    "scroll"
+  ]
+
+  # Target addEventListener
+  proc addEventListener*(componentId: string, effectId: string, target: Target, ev: string, cb: proc(ev: Event)) =
+    if NON_BUBBLE_EVENTS.contains(ev.toLowerAscii()):
+      raise newException(ValueError, "Cannot add event listener for non-bubbling event: " & ev & "\n\nUse a direct EventTarget instead of a Target object.")
+    
+    if not targetEffectListeners.hasKey(effectId):
+      targetEffectListeners[effectId] = initTable[string, Table[string, seq[(Target, proc(ev: Event))]]]()
+    if not targetEffectListeners[effectId].hasKey(componentId):
+      targetEffectListeners[effectId][componentId] = initTable[string, seq[(Target, proc(ev: Event))]]()
+    if not targetEffectListeners[effectId][componentId].hasKey(ev):
+      targetEffectListeners[effectId][componentId][ev] = @[]
+    targetEffectListeners[effectId][componentId][ev].add((target, cb))
+
+
+    let isCreated = registeredTargetEvents.contains(ev)
+    if not isCreated:
+      # add document listener for this event
+      document.addEventListener(ev, proc(event: Event) =
+        let node = event.target
+        if node == nil:
+          raise newException(ValueError, "Event target is null")
+
+        for effectId, componentListeners in targetEffectListeners:
+          for componentId, listeners in componentListeners:
+            if listeners.hasKey(ev):
+              for (target, cb) in listeners[ev]:
+                let closestMatch = node.closest("[id='" & target.id & "']")
+                if closestMatch != nil:
+                  # echo "MATCHED CLOSEST: " & target.id
+                  cb(event)
+      )
+      registeredTargetEvents.add(ev)
+
+else:
+  proc addEventListener*(componentId: string, effectId: string, et: EventTarget, ev: string, cb: proc(ev: Event), useCapture: bool = false) = discard
+  proc addEventListener*(componentId: string, effectId: string, et: EventTarget, ev: string, cb: proc (ev: Event), options: AddEventListenerOptions) = discard
+  proc setInterval*(componentId: string, effectId: string, action: proc(), ms: int): Interval = discard
+  proc setTimeout*(componentId: string, effectId: string, action: proc(), ms: int): TimeOut = discard
+  # proc setInterval*(componentId: string, effectId: string, action: proc(), ms: int) = discard
+  # proc setTimeout*(componentId: string, effectId: string, action: proc(), ms: int)= discard
+
+proc clearEffect(componentId: string, effectId: string) =
+  logState "Clearing: " & componentId & " - " & componentId
+  # echo "Clearing effect event listeners for: ", componentId, " - ", effectId
   if effectListeners.hasKey(effectId) and effectListeners[effectId].hasKey(componentId):
     for (et, ev, cb) in effectListeners[effectId][componentId]:
       et.removeEventListener(ev, cb)
     effectListeners[effectId].del(componentId)
 
-proc useEffect*(componentInstanceId: string, effectId: string, callback: Procedure[proc()]) =
-  # TODO: this needs to happen after render?
-  when defined(js):
-    clearEffectEventListeners(componentInstanceId, effectId)
-    callback()
+  if targetEffectListeners.hasKey(effectId) and targetEffectListeners[effectId].hasKey(componentId):
+    targetEffectListeners[effectId].del(componentId)
 
-proc useEffect*(componentInstanceId: string, effectId: string, jsCallback: string) =
-  when defined(js):
-    {.emit: "window.eval(`jsCallback`)"}
-  else:
-    discard
+  if intervals.hasKey(componentId) and intervals[componentId].hasKey(effectId):
+    for interval in intervals[componentId][effectId]:
+      dom.clearInterval(interval)
+    intervals[componentId].del(effectId)
+  if timeouts.hasKey(componentId) and timeouts[componentId].hasKey(effectId):
+    for timeout in timeouts[componentId][effectId]:
+      dom.clearTimeout(timeout)
+    timeouts[componentId].del(effectId)
+
 
 proc doCallEffect(componentInstanceId: string, effectId: string, deps: openArray[string]): bool =
   when defined(js):
     if deps.len == 0:
-      if eventInitEnabled():
+      if not eventInitialized(componentInstanceId, effectId):
+        # echo "Event not initialized for component: ", componentInstanceId, " effect: ", effectId
+        setEventInitialized(componentInstanceId, effectId)
         return true
     else:
       if effectDeps.hasKey(componentInstanceId & "-" & effectId):
@@ -325,16 +578,32 @@ proc doCallEffect(componentInstanceId: string, effectId: string, deps: openArray
         return true
   else:
     if deps.len == 0:
-      if eventInitEnabled():
+      if eventInitialized(componentInstanceId, effectId):
+        setEventInitialized(componentInstanceId, effectId)
         return true
   return false
 
-proc useEffect*[T](componentInstanceId: string, effectId: string, callback: Procedure[T], deps: openArray[string]) =
-  if doCallEffect(componentInstanceId, effectId, deps):
-    clearEffectEventListeners(componentInstanceId, effectId)
+proc useEffect*(componentInstanceId: string, effectId: string, callback: Procedure[proc()]) =
+  # TODO: this needs to happen after render?
+  when defined(js):
+    clearEffect(componentInstanceId, effectId)
+    # callback()
     discard dom.setTimeout(proc() =
       callback()
-    , 0)
+    , 100) # wait for DOM to render, since the effect will occur before the dom is returned
+
+proc useEffect*(componentInstanceId: string, effectId: string, jsCallback: string) =
+  when defined(js):
+    {.emit: "window.eval(`jsCallback`)"}
+  else:
+    discard
+
+proc useEffect*[T](componentInstanceId: string, effectId: string, callback: Procedure[T], deps: openArray[string]) =
+  if doCallEffect(componentInstanceId, effectId, deps):
+    clearEffect(componentInstanceId, effectId)
+    discard dom.setTimeout(proc() =
+      callback()
+    , 100) # wait for DOM to render, since the effect will occur before the dom is returned
 
 
 proc useEffect*(componentInstanceId: string, effectId: string, jsCallback: string, deps: openArray[string]) =
@@ -368,7 +637,10 @@ proc getStrState*(componentInstanceId: string, key: string): string =
 
 
 proc getState*[T](componentInstanceId: string, key: string): T =
+  # echo "getState: ", componentInstanceId, " - ", key
   let str = getStrState(componentInstanceId, key)
+  # echo "getState: ", componentInstanceId, " - ", key, " -> ", str
+  # echo T.repr
   return fromJson(str, T)
 
 proc setState*[T](componentInstanceId: string, key: string, value: T) =
@@ -377,6 +649,13 @@ proc setState*[T](componentInstanceId: string, key: string, value: T) =
     {.emit: "window.setState(`componentInstanceId`, `key`, `jsonString`)"}
   else:
     logState("not-js, setState", componentInstanceId, key, value)
+    serverSideState[componentInstanceId][key] = jsonString
+proc setStore*[T](componentInstanceId: string, key: string, value: T) =
+  let jsonString = value.toJson()
+  when defined(js):
+    {.emit: "window.setStore(`componentInstanceId`, `key`, `jsonString`)"}
+  else:
+    logState("not-js, setStore", componentInstanceId, key, value)
     serverSideState[componentInstanceId][key] = jsonString
 
 
@@ -416,6 +695,33 @@ proc useState*[T](componentInstanceId: string, key: string, value: T): (T, proc(
         serverSideState[componentInstanceId][key] = nn.toJson()
     )
 
+proc useStore*[T](componentInstanceId: string, key: string, value: T): (T, proc(n: T), proc(cb: proc(cur: T): T = nil): void) =
+  initState(componentInstanceId, key, value)
+  when defined(js):
+    return (
+      getState[T](componentInstanceId, key),
+      proc(n: T) = 
+        setStore(componentInstanceId, key, n)
+      ,
+      proc(cb: proc(cur: T): T = nil) =
+        let cur = getState[T](componentInstanceId, key)
+        let nn = cb(cur)
+        setStore(componentInstanceId, key, nn)
+    )
+  else:
+    # echo "not-js, useState", componentInstanceId, key, intNum
+    # serverSideState[componentInstanceId & "-" & key] = %intNum
+    
+    return (
+      parse[T](serverSideState[componentInstanceId][key]),
+      proc(n: T) =
+        serverSideState[componentInstanceId][key] = n.toJson()
+      ,
+      proc(cb: proc(cur: T): T = nil): void =
+        let cur = parse[T](serverSideState[componentInstanceId][key])
+        let nn = cb(cur)
+        serverSideState[componentInstanceId][key] = nn.toJson()
+    )
 
 
 
@@ -425,10 +731,8 @@ when defined(js):
   import util
 
   {.emit: "if(!window._state) window._state = {}"}
-  {.emit: "window._state_init_enabled = false"}
-  {.emit: "window._event_init_enabled = false"}
 
-  {.emit: """
+  const JS_STATE_LOGIC = """
 window._pendingUpdates = new Set();
 window._isBatchingUpdates = false;
 window._batchTimeout = null;
@@ -465,31 +769,37 @@ window.scheduleStateUpdate = function(componentInstanceId) {
     window._batchTimeout = setTimeout(window.flushStateUpdates, 0);
   }
 };
-"""}
 
-  {.emit: """
 window.initState = function(componentInstanceId, key, value) {
-  if(!window._state_init_enabled) {
+  let stateInitialized = window.isComponentInstanceStateInitialized(componentInstanceId, key);
+  if(stateInitialized) {
     window.stateLog('initState unavailable', componentInstanceId, key, value);
   } else {
+    window.setComponentInstanceStateInitialized(componentInstanceId, key);
     window.stateLog('initState', componentInstanceId, key, value);
     if (window._state[componentInstanceId] == undefined) {
       window._state[componentInstanceId] = {}
     }
     window._state[componentInstanceId][key] = value;
   }
-}"""}
-  {.emit: """
+};
+
 window.getState = function(componentInstanceId, key) {
   window.stateLog('getState', componentInstanceId, key);
   try {
     return window._state[componentInstanceId][key]
   } catch (error) {
-    console.log(error);
+    // console.log(error);
+    // infinitely throw alert with state not found error
+    (async () => {
+      while(true) {
+        alert('FATAL: State not found: ' + componentInstanceId + ' ' + key);
+      }
+    })();
     throw new Error('State not found: ' + componentInstanceId + ' ' + key)
   }
-}"""}
-  {.emit: """
+};
+
 window.setState = function(componentInstanceId, key, value) {
   window.stateLog('setState', componentInstanceId, key, value);
   let preVal = window._state[componentInstanceId][key]
@@ -524,18 +834,37 @@ window.setState = function(componentInstanceId, key, value) {
     // Instead of immediately calling onStateUpdated, schedule a batched update
     window.scheduleStateUpdate(componentInstanceId);
   }
-}"""}
+};
+
+window.setStore = function(componentInstanceId, key, value) {
+  window.stateLog('setStore', componentInstanceId, key, value);
+  let preVal = window._state[componentInstanceId][key]
+  window._state[componentInstanceId][key] = value;
+};
+"""
+  {.emit: JS_STATE_LOGIC.}
 
 
 
   proc hasDOM*(): bool =
-    {.emit: "return window._dom != undefined"}
+    {.emit: "return window._dom != undefined".}
 
-  proc getPreviousDOM*(): HTML =
-    {.emit: "return window._dom"}
+  proc hasSSRDOM*(): bool =
+    {.emit: "return window._ssrDOM != undefined".}
+
+  proc getSSRDOM*(): string =
+    {.emit: "return window._ssrDOM".}
 
   proc isSSR*(): bool =
-    {.emit: "return window._ssr"}
+    {.emit: "return window._ssr".}
+ 
+  proc getPreviousDOM*(): HTML =
+    if not hasDOM() and hasSSRDOM() and isSSR():
+      var ssrDOM = getSSRDOM()
+      let html = fromJson(ssrDOM, HTML)
+      return html
+
+    {.emit: "return window._dom".}
 
   proc render*(html: HTML, fullRender: bool = false) =
     proc doStartAtBody(html: HTML): bool =
@@ -546,8 +875,17 @@ window.setState = function(componentInstanceId, key, value) {
     const voidElements = ["area", "base", "br", "col", "embed", "hr", "img", 
                         "input", "link", "meta", "source", "track", "wbr"]
 
+    # Helper function to check if a DOM node should be preserved
+    proc shouldPreserveNode(domNode: Node): bool =
+      if domNode.nodeType == ElementNode:
+        let element = cast[Element](domNode)
+        # Preserve tags with op='true' attribute
+        if element.hasAttribute("op") and element.getAttribute("op") == "true":
+          return true
+      return false
+
     # if no previous DOM, or forced full render -> do full render
-    if not hasDOM() or fullRender:
+    if (not hasDOM() and not hasSSRDOM()) or fullRender:
       logState("Performing full render")
       if not startAtBody:
         var htmlBody = html
@@ -638,7 +976,10 @@ window.setState = function(componentInstanceId, key, value) {
       # Check if virtual DOM actually changed
       if compareVirtualDOM(previousDOM, html):
         logState("Virtual DOM unchanged, skipping render")
-        {.emit: "window._dom = `html`"}  # Still update the stored DOM
+        lastRender = html
+        lastRenderTime = int64(getTime().toUnixFloat() * 1000)
+        {.emit: "window._last_render = Date.now();".}
+        {.emit: "window._dom = `html`;".}  # Still update the stored DOM
         return
       
       logState("Virtual DOM changed, proceeding with differential render")
@@ -678,9 +1019,20 @@ window.setState = function(componentInstanceId, key, value) {
             inc count
         return count
 
+      # Helper to collect preserved nodes before removal
+      proc collectPreservedNodes(parent: Node, startIndex: int): seq[Node] =
+        var preserved: seq[Node] = @[]
+        var count = 0
+        for child in parent.childNodes:
+          if child.nodeType == ElementNode or child.nodeType == TextNode:
+            if count >= startIndex and shouldPreserveNode(child):
+              preserved.add(child)
+            inc count
+        return preserved
+
       proc check(previousDOM: HTML, html: HTML, parent: Node = nil, depth: int = 0) =
         let indent = repeat("  ", depth)
-        logState(indent & "Checking level with", $previousDOM.len, "old nodes and", $html.len, "new nodes")
+        # logState(indent & "Checking level with", $previousDOM.len, "old nodes and", $html.len, "new nodes")
         
         let oldCount = previousDOM.len
         let newCount = html.len
@@ -694,10 +1046,19 @@ window.setState = function(componentInstanceId, key, value) {
         else:
           getRelevantChildCount(parent)
         
-        logState(indent & "DOM has", $domCount, "relevant children")
+        # logState(indent & "DOM has", $domCount, "relevant children")
+
+        # Collect nodes to preserve before any removal operations
+        let preservedNodes = if parent == nil:
+          if startAtBody:
+            collectPreservedNodes(document.body, newCount)
+          else:
+            collectPreservedNodes(document.documentElement, newCount)
+        else:
+          collectPreservedNodes(parent, newCount)
 
         for i in 0..<max(max(oldCount, newCount), domCount):
-          # Remove extra nodes from DOM
+          # Remove extra nodes from DOM (but preserve special nodes)
           if i >= newCount:
             let nodeEl = if parent == nil:
               if startAtBody: 
@@ -708,8 +1069,13 @@ window.setState = function(componentInstanceId, key, value) {
               getRelevantChild(parent, i)
             
             if nodeEl != nil and nodeEl.parentNode != nil:
-              logState(indent & "Removing child node at index", $i)
-              nodeEl.parentNode.removeChild(nodeEl)
+              # Check if this node should be preserved
+              if shouldPreserveNode(nodeEl):
+                logState(indent & "Preserving node at index", $i, "(script tag or op='true')")
+                continue
+              else:
+                logState(indent & "Removing child node at index", $i)
+                nodeEl.parentNode.removeChild(nodeEl)
             continue
 
           let newNode = html[i]
@@ -737,6 +1103,11 @@ window.setState = function(componentInstanceId, key, value) {
                 document.documentElement.appendChild(newNodeEl)
             else:
               parent.appendChild(newNodeEl)
+            continue
+
+          # Check if existing node should be preserved (skip replacement)
+          if shouldPreserveNode(nodeEl):
+            logState(indent & "Preserving existing node at index", $i, "(script tag or op='true')")
             continue
 
           # Enhanced node comparison with debugging
@@ -768,13 +1139,14 @@ window.setState = function(componentInstanceId, key, value) {
             elif nodeEl.textContent != newNode.text:
               logState(indent & "Updating text content at index", $i, "from:", nodeEl.textContent, "to:", newNode.text)
               nodeEl.textContent = newNode.text
-            else:
-              logState(indent & "Text content unchanged at index", $i)
+            # else:
+              # logState(indent & "Text content unchanged at index", $i)
           
           # Handle element nodes
           elif newNode.kind == htmlnkElement:
             var attributeChanged = false
             
+
             # Normalize attribute values - treat null and empty string as equivalent
             proc normalizeAttrValue(value: cstring): string =
               if value == nil or $value == "null" or $value == "":
@@ -782,39 +1154,86 @@ window.setState = function(componentInstanceId, key, value) {
               else:
                 return $value
             
-            proc safeGetAttribute(node: Node, attrName: string): cstring =
-              {.emit: """
-              var attr = `node`.getAttribute(`attrName`);
-              return attr === null ? "" : attr;
-              """.}
-            
             # Diff attributes with detailed logging
             for k, v in newNode.attributes:
-              let currentValue = normalizeAttrValue(safeGetAttribute(nodeEl, k))
+              let attrValue = nodeEl.getAttribute(k)
+              let currentValue = if attrValue.isNil: "" else: normalizeAttrValue(attrValue)
               let normalizedNewValue = normalizeAttrValue(cstring(v))
               let oldValue = if oldNode.isSome: 
                 normalizeAttrValue(cstring(oldNode.get.attributes.getOrDefault(k, "")))
               else: 
                 ""
               
-              # More precise attribute comparison - only set if actually different
-              if currentValue != normalizedNewValue:
-                # Only setAttribute if the new value is not empty
-                if normalizedNewValue != "":
-                  logState(indent & "Setting attribute", k, "to", normalizedNewValue, "at index", $i, "(current DOM value:", currentValue, ", old virtual value:", oldValue, ")")
-                  nodeEl.setAttribute(k, normalizedNewValue)
-                  attributeChanged = true
+              
+              proc mergeStyles(currentValue: string, newValue: string): string =
+                if currentValue == "":
+                  return newValue
+                elif newValue == "":
+                  return currentValue
                 else:
-                  # Remove attribute if new value is empty/null
-                  if currentValue != "":
-                    logState(indent & "Removing attribute", k, "at index", $i, "(was:", currentValue, ")")
-                    nodeEl.removeAttribute(k)
+                  # Merge styles by splitting by semicolon, then splitting by name and value- update values or add new ones
+                  var currentStyles = currentValue.split(";").mapIt(it.strip())
+                  var newStyles = newValue.split(";").mapIt(it.strip())
+                  var mergedStyles = initTable[string, string]()
+                  for style in currentStyles:
+                    if style != "":
+                      let parts = style.split(":")
+                      if parts.len == 2:
+                        let name = parts[0].strip()
+                        let value = parts[1].strip()
+                        # mergedStyles[parts[0].strip()] = parts[1].strip()
+                        
+                        # only keep if we are a KEEP_STYLE and the value includes a px
+                        const KEEP_STYLES = ["width", "height"]
+                        if name in KEEP_STYLES and value.contains("px"):
+                          mergedStyles[name] = value
+                        else:
+                          # logState("Skipping style", name, "with value", value, "because it is not a KEEP_STYLE")
+                          continue
+                        
+                  for style in newStyles:
+                    if style != "":
+                      let parts = style.split(":")
+                      if parts.len == 2:
+                        let key = parts[0].strip()
+                        let value = parts[1].strip()
+                          # Update existing style value
+                        mergedStyles[key] = value
+                  # Join merged styles back into a string
+                  # return mergedStyles.toSeq().mapIt(it[0] & ": " & it[1]).join("; ")
+                  var str = ""
+                  for key, value in mergedStyles:
+                    if str != "":
+                      str &= "; "
+                    str &= key & ": " & value
+                  return str
+
+              if k == "style":
+                let mergedStyle = mergeStyles(currentValue, normalizedNewValue)
+                if mergedStyle != currentValue:
+                  logState(indent & "Setting style attribute at index", $i, "to", mergedStyle, "(current DOM value:", currentValue, ", old virtual value:", oldValue, ")")
+                  nodeEl.setAttribute(k, mergedStyle)
+                  
+              else:
+                # More precise attribute comparison - only set if actually different
+                if currentValue != normalizedNewValue:
+                  # Only setAttribute if the new value is not empty
+                  if normalizedNewValue != "":
+                    logState(indent & "Setting attribute", k, "to", normalizedNewValue, "at index", $i, "(current DOM value:", currentValue, ", old virtual value:", oldValue, ")")
+                    nodeEl.setAttribute(k, normalizedNewValue)
                     attributeChanged = true
                   else:
-                    logState(indent & "Attribute", k, "remains unset at index", $i)
-              else:
-                logState(indent & "Attribute", k, "unchanged at index", $i, "(normalized value:", normalizedNewValue, ")")
-            
+                    # Remove attribute if new value is empty/null
+                    if currentValue != "":
+                      logState(indent & "Removing attribute", k, "at index", $i, "(was:", currentValue, ")")
+                      nodeEl.removeAttribute(k)
+                      attributeChanged = true
+                    else:
+                      logState(indent & "Attribute", k, "remains unset at index", $i)
+                # else:
+                  # logState(indent & "Attribute", k, "unchanged at index", $i, "(normalized value:", normalizedNewValue, ")")
+              
+              
             # Remove attributes that no longer exist
             if oldNode.isSome:
               for k in oldNode.get.attributes.keys:
@@ -833,46 +1252,75 @@ window.setState = function(componentInstanceId, key, value) {
             else:
               logState(indent & "Skipping children for void element:", newNode.tag, "at index", $i)
 
+        # Re-append preserved nodes that were collected earlier
+        for preservedNode in preservedNodes:
+          if preservedNode.parentNode == nil:  # Only re-append if it was actually removed
+            logState(indent & "Re-appending preserved node")
+            if parent == nil:
+              if startAtBody:
+                document.body.appendChild(preservedNode)
+              else:
+                document.documentElement.appendChild(preservedNode)
+            else:
+              parent.appendChild(preservedNode)
+
       # Start the diffing process
       check(previousDOM, html)
 
+
+    lastRender = html
+    lastRenderTime = int64(getTime().toUnixFloat() * 1000)
+    {.emit: "window._last_render = Date.now();".}
     {.emit: "window._dom = `html`"}
-    {.emit: "window._state_init_enabled = false"}
-    {.emit: "window._event_init_enabled = false"}
+    # {.emit: "window._state_init_enabled = false"}
+    # {.emit: "window._event_init_enabled = false"}
 
   proc renderAll*() =
     logState("Rendering page '" & pageComponentName & "'")
     # log "page: " & pageComponentName
 
-    {.emit: "window._state_init_enabled = true"}
-    {.emit: "window._event_init_enabled = true"}
-    {.emit: "window.removeAllEventListeners()"}
+    # if not isSSR:
+    #   {.emit: "window._state_init_enabled = true"}
+    # {.emit: "window._event_init_enabled = true"}
+    {.emit: "window.removeAllEventListeners();"}
+    {.emit: "window._initializedStateComponentInstances = [];".}
+    {.emit: "window._initializedEffectComponentInstances = [];".}
     render(
-      (pageComponent.get())()
+      (pageComponent.get())(key = DEFAULT_KEY)
     )
+    # {.emit: "window._state_init_enabled = false"}
+    # {.emit: "window._event_init_enabled = false"}
 
   const ALWAYS_FORCE_FULL_RENDER = false
 
+  import times
   proc onStateUpdated*(componentInstanceId: string) =
     logState "State updated for: ", componentInstanceId, "\nAttempting render..."
     # TODO: contemplate grabbing `web thing` for componentInstanceId and rendering from there
 
     # {.emit: "window.removeAllEventListeners()"} # TODO: disabled for useEffect event listener overlap
-    {.emit: "window.removeAllDOMEventListeners()"}
+    # {.emit: "window.removeAllDOMEventListeners()"}
+    let startTime = (epochTime() * 1000).int64
+    let html = (pageComponent.get())(key = DEFAULT_KEY)
+    let elapsedTime = ((epochTime() * 1000).int64) - startTime
+    logState "Render took: " & $elapsedTime & "ms"
+
+    let renderStartTime = (epochTime() * 1000).int64
     render(
-      (pageComponent.get())(),
+      html,
       ALWAYS_FORCE_FULL_RENDER
     )
+    let renderElapsedTime = ((epochTime() * 1000).int64) - renderStartTime
+    logState "Render function took: " & $renderElapsedTime & "ms"
 
   document.addEventListener("DOMContentLoaded", proc(ev: Event) =
-    if isSSR():
-      # {.emit: "window._state_init_enabled = true"}
-      {.emit: "window._event_init_enabled = true"}
-      {.emit: "window.removeAllEventListeners()"}
-      discard (pageComponent.get())()
-      # {.emit: "window._state_init_enabled = false"}
-      {.emit: "window._event_init_enabled = false"}
 
+    # TODO: this is broken, we always need a render on the client side
+
+    if isSSR():
+      # state is injected by server, but effects/events are not intialized/setup so we must render
+      {.emit: "window.removeAllEventListeners();"}
+      discard (pageComponent.get())(key = DEFAULT_KEY)
     else:
       renderAll()
   )
